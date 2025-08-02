@@ -1,0 +1,147 @@
+import cv2
+import numpy as np
+import os
+from skimage.exposure import adjust_gamma
+from itertools import product
+import traceback
+
+# 固定参数组合
+# 城市雾参数范围（适度浓度+灰白基调）
+BETA_LIST = [0.6, 0.6, 0.7, 1]  # 消光系数（浓度）
+A_LIST = [0.92, 0.95, 0.98]     # 散射反照率（灰度）
+
+# 按真实物理特性排序：浓度优先，反照率负向加权
+all_combinations = list(product(BETA_LIST, A_LIST))
+sorted_combinations = sorted(
+    all_combinations,
+    key=lambda x: (x[0] * 4 - x[1]),  # 提升浓度权重，降低高反照率收益
+    reverse=True
+)
+
+# 优化后的暗调雾效参数（按视觉权重排序）
+# 更合理的参数组合（物理真实 + 视觉多样性）
+PARAM_COMBINATIONS = [
+    (2, 0.5),   
+]
+# 其他参数范围
+OTHER_PARAMS = {
+    'gamma': (0.7, 1.3),
+    'noise': (0.02, 0.05)
+}
+
+def generate_fog_effect(rgb_path, depth_path, output_path, beta, A):
+    """生成单张雾效图像"""
+    try:
+        # 验证输入文件
+        if not os.path.exists(rgb_path):
+            raise FileNotFoundError(f"RGB图像不存在: {rgb_path}")
+        if not os.path.exists(depth_path):
+            raise FileNotFoundError(f"深度图不存在: {depth_path}")
+
+        # 读取图像
+        rgb = cv2.imread(rgb_path)
+        depth = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+
+        if rgb is None:
+            raise ValueError(f"无法读取RGB图像: {rgb_path}")
+        if depth is None:
+            raise ValueError(f"无法读取深度图: {depth_path}")
+
+        # 转换到[0,1]范围
+        rgb = rgb.astype(np.float32) / 255.0
+        depth = depth.astype(np.float32) / 255.0
+
+        # 深度图处理
+        depth = cv2.GaussianBlur(depth, (7,7), 2.0)
+        depth = 1.0 - np.power(depth, 1.5)
+
+        # 生成随机参数（固定种子）
+        np.random.seed(abs(hash(os.path.basename(rgb_path))) % (2**32))
+        gamma = np.random.uniform(*OTHER_PARAMS['gamma'])
+        noise_level = np.random.uniform(*OTHER_PARAMS['noise'])
+
+        # 物理雾效模型
+        transmission = np.exp(-beta * depth)
+        atmosphere = A * np.array([0.89, 0.93, 1.0])  # 冷色调
+
+        # 合成雾效
+        foggy = rgb * transmission[..., np.newaxis] + atmosphere * (1 - transmission[..., np.newaxis])
+        foggy = np.clip(foggy, 0, 1)
+
+        # 后处理
+        foggy = adjust_gamma(foggy, gamma)
+        foggy += np.random.normal(scale=noise_level, size=foggy.shape)
+        foggy = np.clip(foggy, 0, 1)
+
+        # 保存结果
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if not cv2.imwrite(output_path, (foggy * 255).astype(np.uint8)):
+            raise IOError(f"无法保存图像到: {output_path}")
+
+        return True
+
+    except Exception as e:
+        print(f"处理失败: {str(e)}")
+        traceback.print_exc()
+        return False
+
+def batch_process():
+    # 路径配置（根据实际结构调整）
+    root = "/media/scdx/E2/wc/hazewc"
+    input_dir = os.path.join(root, "test/gt")      # 原始图像目录
+    depth_dir = os.path.join(root, "depth")       # 深度图目录
+    output_dir = os.path.join(root, "hazed_test")       # 雾效输出目录
+
+    # 验证目录
+    if not os.path.exists(input_dir):
+        raise FileNotFoundError(f"输入目录不存在: {input_dir}")
+    if not os.path.exists(depth_dir):
+        raise FileNotFoundError(f"深度图目录不存在: {depth_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 处理统计
+    success_count = 0
+    fail_count = 0
+
+    # 处理每张图片
+    for img_file in sorted(os.listdir(input_dir)):
+        if not img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            continue
+
+        # 提取基础文件名（如rs00001）
+        base_name = os.path.splitext(img_file)[0]
+
+        # 构建深度图路径（depth_rs00001.png）
+        depth_file = f"depth_{base_name}.png"
+        rgb_path = os.path.join(input_dir, img_file)
+        depth_path = os.path.join(depth_dir, depth_file)
+
+        # 检查深度图是否存在
+        if not os.path.exists(depth_path):
+            print(f"[警告] 缺失深度图: {depth_path}")
+            fail_count += 1
+            continue
+
+        # 为每个参数组合生成雾效
+        for i, (beta, A) in enumerate(PARAM_COMBINATIONS):
+            output_file = f"{base_name}_fog_{i}.png"
+            output_path = os.path.join(output_dir, output_file)
+
+            if generate_fog_effect(rgb_path, depth_path, output_path, beta, A):
+                print(f"[成功] {img_file} -> {output_file} (β={beta:.2f}, A={A:.2f})")
+                success_count += 1
+            else:
+                print(f"[失败] {img_file} (参数组合 {i})")
+                fail_count += 1
+
+    # 打印最终报告
+    print("\n" + "="*50)
+    print(f"处理完成！成功: {success_count} 张，失败: {fail_count} 张")
+    if fail_count > 0:
+        print("\n失败可能原因：")
+        print("1. 深度图命名不符合'depth_rsXXXXX.png'格式")
+        print("2. 图像文件损坏或权限不足")
+        print("3. 内存不足（尝试减小PARAM_COMBINATIONS数量）")
+
+if __name__ == "__main__":
+    batch_process()
